@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/elastic/gosigar/psnotify"
@@ -16,17 +17,105 @@ import (
 
 type ID gousb.ID
 
-type usbhotplugconfig struct {
-	Product ID       `json:"product"`
-	Vendor  ID       `json:"vendor"`
-	CmdUp   []string `json:"up"`
-	CmdDown []string `json:"down"`
+type Command struct {
+	Command string
+	Args    []string
 }
+
+func (command Command) Exec() error {
+	cmd := exec.Command(command.Command, command.Args...)
+	return cmd.Run()
+}
+
+type Commands []Command
 
 type execconfig struct {
 	Binary  string   `json:"bin"`
-	CmdUp   []string `json:"up"`
-	CmdDown []string `json:"down"`
+	CmdUp   Commands `json:"up"`
+	CmdDown Commands `json:"down"`
+}
+
+type usbhotplugconfig struct {
+	Product ID       `json:"product"`
+	Vendor  ID       `json:"vendor"`
+	CmdUp   Commands `json:"up"`
+	CmdDown Commands `json:"down"`
+}
+
+type config struct {
+	USB  []usbhotplugconfig `json:"usb"`
+	Exec []execconfig       `json:"commands"`
+}
+
+func (commands Commands) Exec() []error {
+	fmt.Printf("EXEC=%+v\n", commands)
+	errs := make([]error, 0)
+	for _, cmd := range commands {
+		if err := cmd.Exec(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
+}
+
+func (commands *Commands) UnmarshalJSON(buf []byte) error {
+	var data interface{}
+
+	if err := json.Unmarshal(buf, &data); err != nil {
+		return err
+	}
+
+	switch cmds := data.(type) {
+	case string:
+		cmdparts := strings.Split(cmds, " ")
+		if len(cmdparts) >= 2 {
+			*commands = Commands{{
+				Command: cmdparts[0],
+				Args:    cmdparts[1:],
+			}}
+		} else if len(cmdparts) == 1 {
+			*commands = Commands{{
+				Command: cmdparts[0],
+				Args:    make([]string, 0),
+			}}
+		} else {
+			return fmt.Errorf("unable to support blank command")
+		}
+		return nil
+	case []interface{}:
+		if len(cmds) <= 0 {
+			return fmt.Errorf("unable to support blank command")
+		}
+		if _, ok := cmds[0].(string); ok {
+			args := make([]string, 0)
+			for _, cmdparts := range cmds[1:] {
+				args = append(args, cmdparts.(string))
+			}
+			*commands = Commands{{
+				Command: cmds[0].(string),
+				Args:    args,
+			}}
+			return nil
+		}
+		*commands = make(Commands, 0)
+		for _, cmd := range cmds {
+			cmdparts, ok := cmd.([]interface{})
+			if !ok {
+				return fmt.Errorf("unable to unmarshal command")
+			}
+			args := make([]string, 0)
+			for _, cmdparts := range cmdparts[1:] {
+				args = append(args, cmdparts.(string))
+			}
+			*commands = append(*commands, Command{
+				Command: cmdparts[0].(string),
+				Args:    args,
+			})
+		}
+		return nil
+	default:
+		return fmt.Errorf("unable to unmarshal command format: %+v", data)
+	}
 }
 
 func (id *ID) UnmarshalJSON(data []byte) error {
@@ -40,11 +129,6 @@ func (id *ID) UnmarshalJSON(data []byte) error {
 	}
 	*id = ID(val)
 	return nil
-}
-
-type config struct {
-	USB  []usbhotplugconfig `json:"usb"`
-	Exec []execconfig       `json:"exec"`
 }
 
 func isNumeric(s string) bool {
@@ -73,19 +157,27 @@ func main() {
 			panic(err)
 		}
 
+		fmt.Printf("%+v\n", desc)
 		for _, cfg := range cfg.USB {
 			if desc.Vendor == gousb.ID(cfg.Vendor) && desc.Product == gousb.ID(cfg.Product) {
 				if ev.Type() == gousb.HotplugEventDeviceArrived {
-					cmd := exec.Command(cfg.CmdUp[0], cfg.CmdUp[1:]...)
-					if err := cmd.Run(); err != nil {
-						fmt.Printf("ERROR: %s", err)
+					fmt.Printf("UP=%+v\n", cfg.CmdUp)
+					if errs := cfg.CmdUp.Exec(); len(errs) > 0 {
+						for _, err := range errs {
+							fmt.Printf("ERROR: %s", err)
+						}
 					}
 				} else if ev.Type() == gousb.HotplugEventDeviceLeft {
-					cmd := exec.Command(cfg.CmdDown[0], cfg.CmdDown[1:]...)
-					if err := cmd.Run(); err != nil {
-						fmt.Printf("ERROR: %s", err)
+					fmt.Printf("DOWN=%+v\n", cfg.CmdDown)
+					if errs := cfg.CmdDown.Exec(); len(errs) > 0 {
+						for _, err := range errs {
+							fmt.Printf("ERROR: %s", err)
+						}
 					}
 				}
+			} else {
+				fmt.Printf("%v != %v\n", desc.Vendor, cfg.Vendor)
+				fmt.Printf("%v != %v\n", desc.Product, cfg.Product)
 			}
 		}
 	})
@@ -106,18 +198,20 @@ func main() {
 				bin, _ := os.Readlink(fmt.Sprintf("/proc/%d/exe", ev.Pid))
 				if ex, ok := execs[bin]; ok {
 					log.Printf("exec event: %d->%s", ev.Pid, bin)
-					cmd := exec.Command(ex.CmdUp[0], ex.CmdUp[1:]...)
-					if err := cmd.Run(); err != nil {
-						fmt.Printf("ERROR: %s\n", err)
+					if errs := ex.CmdUp.Exec(); len(errs) > 0 {
+						for _, err := range errs {
+							fmt.Printf("ERROR: %s", err)
+						}
 					}
 					execd[ev.Pid] = ex
 				}
 			case ev := <-pswatcher.Exit:
 				if ex, ok := execd[ev.Pid]; ok {
 					log.Printf("exit event: %d->%s (%+v)", ev.Pid, ex.Binary, ev)
-					cmd := exec.Command(ex.CmdDown[0], ex.CmdDown[1:]...)
-					if err := cmd.Run(); err != nil {
-						fmt.Printf("ERROR: %s\n", err)
+					if errs := ex.CmdDown.Exec(); len(errs) > 0 {
+						for _, err := range errs {
+							fmt.Printf("ERROR: %s", err)
+						}
 					}
 					delete(execd, ev.Pid)
 				}
